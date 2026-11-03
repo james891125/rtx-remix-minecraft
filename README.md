@@ -72,3 +72,15 @@ Original NVIDIA copyright, Apache-2.0 license, attribution notices, and runtime
 third-party license files are preserved in both source and packaged output.
 See [LICENSE](LICENSE), [NOTICE](NOTICE), and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Contributing
+
+Follow [CONTRIBUTING.md](CONTRIBUTING.md). Contributions use the
+[Developer Certificate of Origin](https://developercertificate.org/): sign off
+each contribution with `git commit -s`. There is no Contributor License
+Agreement to sign. Do not represent trial build results as upstream approval.
+
+NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR
+MICROSOFT. Minecraft is a trademark of Mojang Synergies AB.
+NVIDIA, GeForce, and RTX are trademarks and/or registered trademarks of NVIDIA
+Corporation in the U.S. and other countries.
