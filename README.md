@@ -1,176 +1,74 @@
-# RTX Remix for Minecraft
+# RTX Remix for Minecraft 1.21.4: unofficial trial
 
-> **Unvalidated 1.21.4 port trial — not a release.** Dependency pins and selected
-> source adapters target 1.21.4. Compilation, Mixin application, and RTX rendering
-> are not yet verified; renderer migrations remain incomplete. The upstream
-> installation and support information below describes the 1.21.1 baseline.
+This branch packages the experimental Minecraft **1.21.4** port from
+[`efd5280`](https://github.com/james891125/rtx-remix-minecraft/commit/efd5280da270cebe81795a5e3c1ffdfa2cc696f1).
+It is a community trial, **not an NVIDIA release**, and does not claim feature,
+rendering, or performance parity with the upstream Minecraft 1.21.1 version.
+A successful build checks compilation and tests, not live RTX gameplay.
 
-Play Minecraft Java Edition 1.21.1 with real-time path tracing on a GeForce RTX
-GPU, powered by NVIDIA RTX Remix.
+## Install the trial
 
-## What To Expect
+Use an installer ZIP built from this branch, not an upstream 1.21.1 release
+or a lightweight JAR from `build/libs`.
 
-This is a beta. It was built as a technology showcase, but we love Minecraft
-and want it to succeed as a rendering mod. We tuned it against one showcase
-world, built for this project by [BlockWorks](https://www.blockworks.uk/) (see
-[Showcase World And Art Pack](#showcase-world-and-art-pack)), and the places
-that world visits are where it looks and runs best. We have worked hard to fix
-as many issues as we could, but it ships with
-[known issues](https://github.com/NVIDIAGameWorks/rtx-remix-minecraft/issues),
-and there are certainly bugs yet to be discovered.
+1. Extract the entire ZIP to a normal folder on Windows x64.
+2. Run `install.bat` without administrator privileges. Choose Install.
+3. Sign in to your own Minecraft Java Edition account in Prism Launcher.
+4. Launch **RTX Remix 1.21.4 Trial**. Test with a new world or a backup copy.
 
-Three areas have had less attention than the rest:
+See [the archive README](packaging/INSTALL.md) and
+[installer reference](packaging/INSTALLER_REFERENCE.md).
+The trial uses a new Prism instance. Microsoft Launcher support is disabled
+because the upstream installer uses its shared `.minecraft` directory.
+Existing 1.21.1 instances and the branch backing upstream PR #71 are not
+migration targets. Do not manually copy this JAR into an existing 1.21.1 game.
 
-- **Other mods.** It has had limited testing alongside other mods, and a
-  renderer that takes over the scene the way this one does is likely to
-  conflict with anything that changes rendering or the chunk pipeline.
-- **A full playthrough.** Blocks, mobs, dimensions, and situations the showcase
-  never reaches have had less care, and some will look wrong or run slowly.
-- **Other versions.** It targets Minecraft 1.21.1 only, chosen because that is
-  where the modding community is today. Ports to newer versions are something
-  we hope the community takes on.
+## Build an installable ZIP
 
-We hope the community helps fill it out. If something breaks,
-[report it](docs/PLAYING.md#reporting-a-bug); if you can fix it, see
-[Contributing](#contributing).
+Requirements: Windows, Git, a 64-bit JDK 21, and Visual Studio C++ tools.
+The runtime is fetched from the unchanged public Packman pins. No game account
+or credentials are needed to build. Use a fresh checkout; do not build while
+Minecraft is using that checkout's native files.
 
-## Download
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File packaging/test_trial_installer.ps1
+.\gradlew.bat --no-daemon clean releaseArchive -Parch=win64
+powershell -NoProfile -ExecutionPolicy Bypass -File packaging/verify_trial_archive.ps1
+```
 
-Download the release archive from the
-[Releases page](https://github.com/NVIDIAGameWorks/rtx-remix-minecraft/releases/latest).
+`releaseArchive` runs the Java build and tests, compiles the x64 JNI bridge,
+verifies the bundled runtime and licenses, then writes the installer ZIP to
+`build/distributions/`. The final verifier checks the ZIP and bundled JAR and
+writes SHA-256 checksums. These commands build an archive only; they do not install or launch the game.
+This branch does not publish releases or upload public build artifacts.
 
-## Install in three steps
+## Trial boundaries
 
-1. Extract the release archive.
-2. Double-click `install.bat` and follow the menu.
-3. Launch the **NVIDIA RTX Remix for Minecraft** profile from your launcher.
+- Minecraft 1.21.4, Fabric Loader 0.16.9, Fabric API 0.119.4+1.21.4, Java 21.
+- The build commands above produce **Windows x64 only**. ARM64 requires a separately
+  built matching runtime; the installer rejects an archive lacking its host's
+  native payload before changing the launcher.
+- The named trial instance must match the Minecraft and Fabric pins before
+  reuse. An incomplete or mismatched instance is refused, not converted.
+- Junctions and symbolic links in installation/deletion targets are refused.
+- The installer is unsigned. Inspect the source and checksum before running.
+- Live login, world loading, shader compilation, rendering, and performance
+  still require testing on suitable RTX hardware. A ZIP is not evidence that
+  the entire port works.
 
-The step-by-step version, with launcher advice and troubleshooting, is in
-[Playing](docs/PLAYING.md).
+The upstream architecture and development guides remain under [docs/](docs/)
+and [tools/](tools/). They describe the 1.21.1 baseline unless explicitly
+updated for this port. Baseline feature lists are not trial acceptance results.
 
-## Requirements
+## Privacy and licensing
 
-- Windows 10 or 11, x64 or ARM64.
-- Minecraft Java Edition 1.21.1, on a Microsoft account that owns the game.
-- A GeForce RTX 30-series or newer GPU with NVIDIA driver 616.92 or newer.
-- About 5 GB of free disk space while installing; about 3 GB stays in use.
-- An internet connection while the installer runs.
-- 16 GB of system memory is recommended.
+The mod's bundled RTX Remix runtime can send session information and crash
+reports to NVIDIA. Review the runtime's First Use Guide and Permissions tab;
+see [the upstream privacy explanation](docs/PLAYING.md#crash-reports-and-privacy).
+No launcher accounts, access tokens, saves, or user settings are bundled in the
+build artifacts.
 
-Java 21, Fabric, and the RTX Remix runtime are installed for you.
-
-Building and running from source has its own
-[prerequisites](docs/GETTING_STARTED.md#prerequisites), including Prism
-Launcher, signed in to a Microsoft account that owns Minecraft: Java Edition.
-
-## Crash Reports And Privacy
-
-The mod collects no data of its own. The RTX Remix runtime it carries can send
-basic session information and crash reports to NVIDIA. Its First Use Guide asks
-about both, with both on by default, and the Permissions tab of the RTX Remix
-Graphics Settings menu changes them at any time.
-[Crash Reports And Privacy](docs/PLAYING.md#crash-reports-and-privacy) lists
-what is sent.
-
-## What it does
-
-**Every block, mob, and item is lit by a path tracer.** Light bounces off walls,
-through glass, and out of torches the way it does in a film renderer, so shadows,
-reflections, and the colour a nearby block casts on its neighbours are all
-computed rather than painted in.
-
-**The look follows the game.** Time of day, weather, and being underwater each
-bring their own lighting, and a map author can attach a look to a place in the
-world. Nothing needs switching on.
-
-**A new block.** The Copper Beacon is a directional lamp you can place or
-carry, and its beam is a real light that picks out walls, rain, and anything
-standing in it.
-
-**Camera flythroughs.** Record a path by walking it, then replay it, for a video
-or for an exact before-and-after comparison.
-
-**A settings screen in the game.** Distances, framerate, sky, lighting,
-exposure, and materials, all in Options, with no config files to edit, and a
-button into Remix's own Graphics Settings for the quality tier.
-
-## Showcase World And Art Pack
-
-Two optional extras go with the mod. The developer launcher in
-[`tools/`](tools/README.md) downloads both the first time it runs and launches
-into the world with the pack on.
-
-- **The showcase world**, the map the renderer was tuned against, was built for
-  this project by BlockWorks: [website](https://www.blockworks.uk/),
-  [YouTube](https://www.youtube.com/@BlockWorksYT),
-  [X](https://x.com/BlockWorksYT), and
-  [Instagram](https://www.instagram.com/blockworks/).
-- **The RTX art pack**, a texture resource pack, was created by an art team at
-  NVIDIA. Its normal and specular maps follow the
-  [LabPBR standard](https://shaderlabs.org/wiki/LabPBR_Material_Standard), so
-  other renderers and shader packs that read LabPBR may be able to use it too,
-  but it has only been tested with this mod. Its `_sss` subsurface maps are
-  this mod's own addition, described in
-  [Resource Packs](docs/RESOURCE_PACKS.md).
-
-## Start Here
-
-| You want to | Read |
-|---|---|
-| Play with path tracing | [Playing](docs/PLAYING.md) |
-| Check the known issues | [Issue tracker](https://github.com/NVIDIAGameWorks/rtx-remix-minecraft/issues) |
-| Play on a server | [Multiplayer](docs/PLAYING.md#multiplayer) |
-| Configure the renderer | [Settings](docs/SETTINGS.md) |
-| Look up a command, a key, or a mod-added block | [In-Game Guide](docs/IN_GAME_GUIDE.md) |
-| Give your own map its own lighting | [Gameplay-driven profiles](packaging/rtx-remix/mods/minecraft-logic/README.md) |
-| Make a texture pack this renderer understands | [Resource Packs](docs/RESOURCE_PACKS.md) |
-| Record a camera flythrough | [Camera Paths](docs/CAMERA_PATHS.md) |
-| Install, repair, or uninstall in detail | [packaging/INSTALL.md](packaging/INSTALL.md) |
-| Build and run from source | [Getting Started](docs/GETTING_STARTED.md) |
-| Tune the developer knobs behind the renderer | [Tuning](docs/TUNING.md) |
-| Diagnose a rendering or native integration problem | [Rendering Diagnostics](docs/RENDERING_DIAGNOSTICS.md) |
-| Contribute a change | [CONTRIBUTING.md](CONTRIBUTING.md) |
-| Report a bug | [Reporting a Bug](docs/PLAYING.md#reporting-a-bug) |
-| Report a security vulnerability | [SECURITY.md](SECURITY.md) |
-| See what changed | [CHANGELOG.md](CHANGELOG.md) |
-
-## Source And Tooling Layout
-
-| Path | Purpose |
-|---|---|
-| `src/` | Mod implementation and JVM tests |
-| `rtxremix-java/` | Minecraft-agnostic Java facade and JNI bridge over the RTX Remix C API |
-| `tools/` | Developer launcher, benchmarks, profiling, SDK staging, and development installation |
-| `packman/` | Packman bootstrap and runtime package pins |
-| `packaging/` | Public installer, runtime defaults, and distribution payload |
-| `docs/` | Player, authoring, and source-build guides |
-
-NVIDIA maintains some release and CI tooling outside this repository. It is
-not required by the public Gradle build, the developer tools, or the installed
-mod.
-
-## Contributing
-
-External contributions are welcome, and the gaps above are where help matters
-most: compatibility with other mods, coverage of the blocks, mobs, and places a
-real playthrough reaches, and performance on hardware we do not have. Fork this
-repository, create a development branch, and submit a pull request. Sign off
-each commit with `git commit -s` to certify it under the
-[Developer Certificate of Origin](https://developercertificate.org/); there is
-no Contributor License Agreement to sign. See [CONTRIBUTING.md](CONTRIBUTING.md)
-for the full guidelines.
-
-## License
-
-This project is licensed under the Apache License, Version 2.0 (`Apache-2.0`).
-See the [LICENSE](LICENSE) file. Attribution notices are in [NOTICE](NOTICE),
-and third-party software distributed with this project is documented in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Release archives also carry
-the RTX Remix runtime, whose NVIDIA components are covered by their own license
-terms; THIRD_PARTY_NOTICES.md lists them.
-
-NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR
-MICROSOFT. Minecraft is a trademark of Mojang Synergies AB.
-
-NVIDIA, GeForce, and RTX are trademarks and/or registered trademarks of NVIDIA
-Corporation in the U.S. and other countries.
+Original NVIDIA copyright, Apache-2.0 license, attribution notices, and runtime
+third-party license files are preserved in both source and packaged output.
+See [LICENSE](LICENSE), [NOTICE](NOTICE), and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

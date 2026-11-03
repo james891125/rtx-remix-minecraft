@@ -10,7 +10,7 @@ LaunchController::executeTask in launcher/LaunchController.cpp). It gives the ga
 -Xms<MinMemAlloc>m -Xmx<MaxMemAlloc>m from the instance's memory settings after JvmArgs
 (MinecraftInstance::javaArguments in launcher/minecraft/MinecraftInstance.cpp). Prism reads instance.cfg through
 QSettings, where only keys before the first section header or under [General] are the instance's settings
-(INIFile::loadFile in launcher/settings/INIFile.cpp). The Microsoft launcher accepts -Xmx in a profile's javaArgs."""
+(INIFile::loadFile in launcher/settings/INIFile.cpp). The trial must never change Microsoft launcher profiles."""
 
 import json
 import os
@@ -32,8 +32,8 @@ INSTALLER = util.PROJECT_DIR / "packaging" / "installer.ps1"
 PRISM_DEFAULT_MIN_MIB = 512
 PRISM_DEFAULT_MAX_MIB = 4096
 # Loads the installer's constants and functions without its entry point, answers its yes/no prompt with -Answer after
-# printing PROMPTED, and runs one step: Sync and SyncMicrosoft reconcile the Prism instance's or the Microsoft launcher
-# profile's JVM configuration, JavaPin pins the managed JDK as on ARM64, and the other actions print what an installer
+# printing PROMPTED, and runs one step: Sync reconciles the Prism instance; Microsoft actions must be rejected.
+# JavaPin pins the managed JDK as on ARM64, and the other actions print what an installer
 # function returns for the JVM args in PRISM_TEST_JVM_ARGS. That is an environment variable because PowerShell would
 # read a leading '-' in a -File argument as a parameter name. SyncMicrosoft finds launcher_profiles.json under APPDATA.
 # With PRISM_TEST_NEXT_JVM_ARGS set, the installer is the next one: RECOMMENDED_JVM_ARGS is that value, and the current
@@ -63,7 +63,21 @@ if ($env:PRISM_TEST_NEXT_JVM_ARGS) {
 }
 switch ($Action) {
     'Sync' { Sync-JvmArgs -For Prism -PrismCfg $Cfg -Unattended:$Unattended }
-    'SyncMicrosoft' { Sync-JvmArgs -For Microsoft -Unattended:$Unattended }
+    { $_ -in 'SyncMicrosoft', 'WriteMicrosoft', 'InitializeMicrosoft', 'RenameMicrosoft' } {
+        $rejected = $false
+        try {
+            switch ($Action) {
+                'SyncMicrosoft' { Sync-JvmArgs -For Microsoft -Unattended:$Unattended }
+                'WriteMicrosoft' { Write-MsLauncherJvmArgs -JvmArgs $script:RECOMMENDED_JVM_ARGS }
+                'InitializeMicrosoft' { Initialize-MicrosoftLauncher -JavaExe 'java.exe' -Unattended:$Unattended }
+                'RenameMicrosoft' { Set-MsLauncherProfileName }
+            }
+        } catch {
+            $rejected = $true
+            Write-Host "Rejected Microsoft action: $($_.Exception.Message)"
+        }
+        if (-not $rejected) { throw 'Microsoft action unexpectedly succeeded' }
+    }
     'JavaPin' {
         function Test-HostIsArm64 { return $true }
         $script:MANAGED_JDK_DIR = $ManagedJdk
@@ -88,7 +102,7 @@ switch ($Action) {
 }
 """
 PROMPTED = "Confirm-YesNo:"
-INSTANCE_NAME = "NVIDIA RTX Remix for Minecraft"
+INSTANCE_NAME = "RTX Remix 1.21.4 Trial"
 # instance.cfg as Initialize-PrismInstance creates it.
 NEW_INSTANCE = f"InstanceType=OneSix\r\nname={INSTANCE_NAME}\r\nJavaVersion=21"
 USER_MEMORY = "OverrideMemory=true\r\nMinMemAlloc=1024\r\nMaxMemAlloc=8192\r\n"
@@ -344,15 +358,16 @@ def sync_microsoft(tmp_path: Path) -> SyncMicrosoft:
         unattended: bool = False,
         next_jvm_args: str | None = None,
         profile_name: str = "Fabric",
+        action: str = "SyncMicrosoft",
     ) -> tuple[dict[str, Any], str]:
-        """The Fabric profile in launcher_profiles.json after the reconcile, from one whose javaArgs are `java_args`,
-        or that has none when it is None."""
+        """Reject a Microsoft write and verify that the complete launcher profile stays byte-for-byte unchanged."""
         profile = {"lastVersionId": MS_PROFILE_KEY, "name": profile_name, "type": "custom"}
         if java_args is not None:
             profile["javaArgs"] = java_args
         profiles.parent.mkdir(parents=True, exist_ok=True)
         profiles.write_text(json.dumps({"profiles": {MS_PROFILE_KEY: profile}, "version": 3}), encoding="utf-8")
-        arguments = ["-Answer", answer, "-Action", "SyncMicrosoft"]
+        before = profiles.read_bytes()
+        arguments = ["-Answer", answer, "-Action", action]
         if unattended:
             arguments.append("-Unattended")
         env = {key: value for key, value in os.environ.items() if key != "PRISM_TEST_NEXT_JVM_ARGS"}
@@ -360,6 +375,9 @@ def sync_microsoft(tmp_path: Path) -> SyncMicrosoft:
         if next_jvm_args is not None:
             env["PRISM_TEST_NEXT_JVM_ARGS"] = next_jvm_args
         output = run_harness(tmp_path, *arguments, env=env)
+        assert profiles.read_bytes() == before
+        assert not profiles.with_suffix(".json.bak").exists()
+        assert sorted(path.name for path in profiles.parent.iterdir()) == ["launcher_profiles.json"]
         return json.loads(profiles.read_text(encoding="utf-8"))["profiles"][MS_PROFILE_KEY], output
 
     return run
@@ -656,6 +674,19 @@ def test_removing_the_instance_removes_its_record(tmp_path: Path):
     for name in ("instance.cfg", RECORD):
         (instance / name).write_text(name, encoding="utf-8")
 
+    (instance / "mmc-pack.json").write_text(
+        json.dumps(
+            {
+                "formatVersion": 1,
+                "components": [
+                    {"uid": "net.minecraft", "version": "1.21.4"},
+                    {"uid": "net.fabricmc.fabric-loader", "version": "0.16.9"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
     run_harness(tmp_path, "-Action", "RemoveInstance", "-Dest", str(data_dir))
 
     assert not instance.exists()
@@ -802,78 +833,26 @@ def test_arm64_java_pin_keeps_unicode(sync: Sync, tmp_path: Path):
 
 
 @pytest.mark.parametrize("unattended", [True, False], ids=["unattended", "interactive"])
-def test_new_microsoft_launcher_profile_gets_the_full_recommended_args(sync_microsoft: SyncMicrosoft, unattended: bool):
-    profile, output = sync_microsoft(None, unattended=unattended)
-
-    assert profile["javaArgs"] == RECOMMENDED
-    assert PROMPTED not in output
-
-
-def test_microsoft_launcher_profile_with_the_full_recommended_args_is_left_alone(sync_microsoft: SyncMicrosoft):
-    profile, output = sync_microsoft(RECOMMENDED)
-
-    assert profile["javaArgs"] == RECOMMENDED
-    assert "already match" in output
-    assert PROMPTED not in output
-
-
-def test_replacing_microsoft_launcher_args_gives_the_full_recommended_args(sync_microsoft: SyncMicrosoft):
-    profile, output = sync_microsoft("-Xmx6G -XX:+UseG1GC", answer="yes")
-
-    assert PROMPTED in output
-    assert RECOMMENDED in output
-    assert profile["javaArgs"] == RECOMMENDED
-    assert not refusal_lines(output)
-
-
-@pytest.mark.parametrize("unattended", [True, False], ids=["unattended", "interactive"])
-@pytest.mark.parametrize("previous", list(PREVIOUS_RECOMMENDED.values()), ids=list(PREVIOUS_RECOMMENDED))
-def test_microsoft_launcher_args_an_earlier_installer_wrote_are_replaced_without_asking(
-    sync_microsoft: SyncMicrosoft, tmp_path: Path, previous: str, unattended: bool
+@pytest.mark.parametrize("action", ["SyncMicrosoft", "WriteMicrosoft", "InitializeMicrosoft", "RenameMicrosoft"])
+@pytest.mark.parametrize(
+    "java_args",
+    [None, RECOMMENDED, USER_EDITED_PREVIOUS, *PREVIOUS_RECOMMENDED.values()],
+    ids=["absent", "recommended", "user-edited", *PREVIOUS_RECOMMENDED],
+)
+def test_trial_rejects_microsoft_changes_and_preserves_profiles(
+    sync_microsoft: SyncMicrosoft, unattended: bool, action: str, java_args: str | None
 ):
-    profile, output = sync_microsoft(previous, unattended=unattended)
-
-    assert PROMPTED not in output
-    assert profile["javaArgs"] == RECOMMENDED
-    assert f"Previous JVM args, kept in launcher_profiles.json.bak: {previous}" in output
-    backup = json.loads(
-        (tmp_path / "AppData" / ".minecraft" / "launcher_profiles.json.bak").read_text(encoding="utf-8")
-    )
-    assert backup["profiles"][MS_PROFILE_KEY]["javaArgs"] == previous
-
-
-def test_unattended_microsoft_migration_preserves_utf8_profile_metadata(sync_microsoft: SyncMicrosoft):
     name = "Minecraft プレイヤー"
+    profile, output = sync_microsoft(java_args, answer="yes", unattended=unattended, action=action, profile_name=name)
 
-    profile, _ = sync_microsoft(
-        next(iter(PREVIOUS_RECOMMENDED.values())),
-        unattended=True,
-        profile_name=name,
-    )
-
-    assert profile["name"] == name
-    assert profile["javaArgs"] == RECOMMENDED
-
-
-@pytest.mark.parametrize("unattended", [True, False], ids=["unattended", "interactive"])
-def test_the_next_installer_updates_the_microsoft_launcher_profile_without_asking(
-    sync_microsoft: SyncMicrosoft, unattended: bool
-):
-    next_args = NEXT_RECOMMENDED["gc-list-and-heap"]
-
-    profile, output = sync_microsoft(RECOMMENDED, unattended=unattended, next_jvm_args=next_args)
-
+    assert "Rejected Microsoft action:" in output
     assert PROMPTED not in output
-    assert profile["javaArgs"] == next_args
-
-
-@pytest.mark.parametrize("unattended", [True, False], ids=["unattended", "declined"])
-def test_microsoft_launcher_args_a_user_edited_are_the_users(sync_microsoft: SyncMicrosoft, unattended: bool):
-    profile, output = sync_microsoft(USER_EDITED_PREVIOUS, unattended=unattended)
-
-    assert profile["javaArgs"] == USER_EDITED_PREVIOUS
-    assert (PROMPTED in output) is not unattended
-    assert ("keeping existing (unattended)" in output) is unattended
+    assert profile["name"] == name
+    assert profile.get("javaArgs") == java_args
+    if action == "SyncMicrosoft":
+        assert "Microsoft" in output and "Prism" in output and "For" in output
+    else:
+        assert "Microsoft Launcher changes are disabled" in output
 
 
 def test_prism_jvm_args_leave_out_only_the_heap_sizes(prism_jvm_args: PrismJvmArgs):

@@ -2,15 +2,15 @@
     "schemaVersion": 1,
     "id": "rtx-remix-renderer",
     "version": "${version}",
-    "name": "RTX Remix for Minecraft",
-    "description": "Renders Minecraft through NVIDIA RTX Remix path tracing. NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.",
+    "name": "RTX Remix for Minecraft 1.21.4 (Unofficial Trial)",
+    "description": "Unofficial experimental Minecraft 1.21.4 port of NVIDIA RTX Remix rendering. Not an NVIDIA release. NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.",
     "authors": [
         "NVIDIA"
     ],
     "contact": {
-        "homepage": "https://github.com/NVIDIAGameWorks/rtx-remix-minecraft",
-        "sources": "https://github.com/NVIDIAGameWorks/rtx-remix-minecraft",
-        "issues": "https://github.com/NVIDIAGameWorks/rtx-remix-minecraft/issues"
+        "homepage": "https://github.com/james891125/rtx-remix-minecraft/tree/trial/minecraft-1.21.4-installer",
+        "sources": "https://github.com/james891125/rtx-remix-minecraft/tree/trial/minecraft-1.21.4-installer",
+        "issues": "https://github.com/james891125/rtx-remix-minecraft/issues"
     },
     "license": "Apache-2.0",
     "environment": "*",

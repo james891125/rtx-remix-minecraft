@@ -4,8 +4,8 @@
 """What a player sees running packaging/installer.ps1 from its menu, under Windows PowerShell 5.1 as
 packaging/install.bat runs it.
 
-With the mod in one launcher, the main menu puts Upgrade or Repair first, and both keep that launcher without asking.
-Install asks, so it is the way into the other launcher, and the menu and the run both have to say so.
+The unofficial trial always selects Prism, regardless of other installed launchers, and rejects an explicit
+Microsoft preference. The menu describes the isolated 1.21.4 trial instance.
 
 A double-clicked install.bat owns its console window, which closes when the installer exits. A run that started from
 the menu therefore waits for a key first, or its result and any error vanish with the window."""
@@ -34,7 +34,7 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 # QUEUED, and a wait for a fresh key prints HELD.
 HARNESS = r"""
 param([string]$Installer, [string]$Loaded, [string]$Action, [string]$Installed, [switch]$NoPrism, [switch]$NoMs,
-      [string]$Mode, [switch]$Unattended, [string]$Choice, [string]$Outcome, [int]$Queued)
+      [string]$Preferred, [string]$Mode, [switch]$Unattended, [string]$Choice, [string]$Outcome, [int]$Queued)
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$null, [ref]$null)
 $entryPoint = $ast.EndBlock.Statements[-1]
 if ($entryPoint -isnot [System.Management.Automation.Language.TryStatementAst]) {
@@ -57,11 +57,15 @@ function Invoke-Menu {
 switch ($Action) {
     'Upgrade' {
         $detected = [pscustomobject]@{ ModInstalled = $mods }
-        $picked = Select-Launcher -State $launchers -DetectedState $detected -BiasToInstalledLauncher
+        $picked = Select-Launcher -State $launchers -DetectedState $detected `
+            -BiasToInstalledLauncher -Preferred $Preferred
         Write-Host "Picked: $picked"
     }
     'Install' {
-        Write-Host "Picked: $(Select-Launcher -State $launchers)"
+        Write-Host "Picked: $(Select-Launcher -State $launchers -Preferred $Preferred)"
+    }
+    'Uninstall' {
+        Write-Host "Picked: $(Select-LauncherForUninstall -State $launchers -Preferred $Preferred)"
     }
     'MainMenu' {
         function Get-DetectedState {
@@ -138,61 +142,43 @@ def run_step(tmp_path: Path, action: str, installed: str, *, prism: bool = True,
     return ANSI.sub("", result.stdout)
 
 
-@pytest.mark.parametrize(
-    ("installed", "prism", "other"),
-    [
-        ("Microsoft", False, "Prism"),
-        ("Microsoft", True, "Prism"),
-        ("Prism", True, "the Microsoft launcher"),
-    ],
-)
-def test_upgrade_keeps_the_launcher_with_the_mod_and_says_how_to_reach_the_other(
-    tmp_path: Path, installed: str, prism: bool, other: str
+@pytest.mark.parametrize("action", ["Install", "Upgrade", "Uninstall"])
+@pytest.mark.parametrize("installed", ["", "Microsoft", "Prism", "Microsoft,Prism"])
+@pytest.mark.parametrize("prism", [False, True])
+@pytest.mark.parametrize("ms", [False, True])
+def test_trial_always_selects_prism_without_a_launcher_prompt(
+    tmp_path: Path, action: str, installed: str, prism: bool, ms: bool
 ):
-    output = run_step(tmp_path, "Upgrade", installed, prism=prism)
-    assert f"Picked: {installed}" in output.splitlines()
-    assert any(f"install into {other} instead" in line and "choose Install" in line for line in output.splitlines())
-
-
-@pytest.mark.parametrize(
-    ("installed", "prism", "other"),
-    [
-        ("Microsoft", False, "Prism"),
-        ("Microsoft", True, "Prism"),
-        ("Prism", True, "the Microsoft launcher"),
-    ],
-)
-def test_the_menu_offers_install_as_the_way_into_the_other_launcher(
-    tmp_path: Path, installed: str, prism: bool, other: str
-):
-    output = run_step(tmp_path, "MainMenu", installed, prism=prism)
-    items = [line for line in output.splitlines() if line.startswith("Item: ")]
-    assert items[0].startswith("Item: Upgrade |")
-    assert f"Item: Install | choose the launcher, e.g. to use {other} instead" in items
-
-
-def test_with_only_the_microsoft_launcher_install_still_offers_to_download_prism(tmp_path: Path):
-    output = run_step(tmp_path, "Install", "Microsoft", prism=False)
-    assert any(line.startswith("Asked:") and "install Prism portable" in line for line in output.splitlines())
-
-
-@pytest.mark.parametrize("action", ["Install", "Upgrade"])
-def test_with_prism_and_no_microsoft_launcher_the_installer_uses_prism_without_asking(tmp_path: Path, action: str):
-    output = run_step(tmp_path, action, "Prism", ms=False)
+    output = run_step(tmp_path, action, installed, prism=prism, ms=ms)
     assert "Picked: Prism" in output.splitlines()
     assert "Asked:" not in output
-    assert "install into" not in output
 
 
-def test_with_prism_and_no_microsoft_launcher_the_menu_says_what_the_microsoft_launcher_needs(tmp_path: Path):
-    # Install cannot offer a launcher that is not there, so the hint says what it does instead and how to change that.
-    items = run_step(tmp_path, "MainMenu", "Prism", ms=False).splitlines()
-    assert "Item: Install | reinstall into Prism; for the Microsoft launcher, install and start it first" in items
+@pytest.mark.parametrize("action", ["Install", "Upgrade", "Uninstall"])
+def test_trial_rejects_an_explicit_microsoft_launcher(tmp_path: Path, action: str):
+    result = run_harness(tmp_path, "-Action", action, "-Preferred", "Microsoft")
+    assert result.returncode != 0
+    assert "Microsoft Launcher is disabled in this trial" in result.stderr
+    assert "Picked:" not in result.stdout
 
 
-def test_the_menu_install_item_asks_for_the_launcher_when_both_have_the_mod(tmp_path: Path):
-    items = run_step(tmp_path, "MainMenu", "Microsoft,Prism").splitlines()
-    assert "Item: Install | choose the launcher" in items
+@pytest.mark.parametrize("action", ["Install", "Upgrade", "Uninstall"])
+def test_trial_accepts_an_explicit_prism_launcher(tmp_path: Path, action: str):
+    result = run_harness(tmp_path, "-Action", action, "-Preferred", "Prism")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Picked: Prism" in result.stdout.splitlines()
+    assert "Asked:" not in result.stdout
+
+
+@pytest.mark.parametrize("installed", ["Microsoft", "Prism", "Microsoft,Prism"])
+@pytest.mark.parametrize("prism", [False, True])
+@pytest.mark.parametrize("ms", [False, True])
+def test_menu_describes_reinstalling_the_isolated_trial_instance(tmp_path: Path, installed: str, prism: bool, ms: bool):
+    output = run_step(tmp_path, "MainMenu", installed, prism=prism, ms=ms)
+    items = [line for line in output.splitlines() if line.startswith("Item: ")]
+    assert items[0].startswith("Item: Upgrade |")
+    assert "Item: Install | reinstall into the isolated 1.21.4 trial instance" in items
+    assert not any("Microsoft" in item or "choose the launcher" in item for item in items)
 
 
 @pytest.mark.parametrize(("outcome", "code"), [("ok", 0), ("fail", 1), ("throw", 1)])

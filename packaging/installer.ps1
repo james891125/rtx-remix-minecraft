@@ -29,14 +29,13 @@
       Export    Zip a Prism instance into a portable archive (Prism only).
 
 .PARAMETER Launcher
-    Prism | Microsoft. Picks a launcher without prompting. Required in
-    -Unattended mode if both launchers are present (otherwise we fail fast
-    rather than silently choose one).
+    Prism only. Microsoft Launcher is disabled for this unofficial trial
+    to protect its shared game directory and other Fabric profiles.
 
 .PARAMETER Unattended
     Headless mode. No prompts; reasonable defaults for everything.
     Uninstall additionally requires -AcknowledgeDataLoss. Export requires
-    -OutputPath. Ambiguous launcher detection errors instead of defaulting.
+    -OutputPath. All operations are restricted to the named trial instance.
 
 .PARAMETER AcknowledgeDataLoss
     Required alongside -Unattended -Mode Uninstall to avoid accidental wipes
@@ -55,7 +54,7 @@
 
 .PARAMETER PrismDataDir
     Override Prism Launcher's data directory (default: detected, or the
-    managed portable install at %LOCALAPPDATA%\RtxRemixMinecraft\PrismLauncher).
+    managed portable install at %LOCALAPPDATA%\RtxRemixMinecraftTrial1214\PrismLauncher).
     Needed when Prism is on PATH but uses a non-standard data dir.
 
 .PARAMETER SkipHashCheck
@@ -103,7 +102,7 @@ param(
     [ValidateSet('Install', 'Upgrade', 'Repair', 'Uninstall', 'Export')]
     [string]$Mode,
 
-    [ValidateSet('Prism', 'Microsoft')]
+    [ValidateSet('Prism')]
     [string]$Launcher,
 
     [switch]$Unattended,
@@ -130,16 +129,12 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # --- Constants (kept in sync with build.gradle / rtxremix-java) ---
-$script:APP_VERSION          = '0.1.0'
-$script:PRISM_INSTANCE_NAME  = 'NVIDIA RTX Remix for Minecraft'
-# Legacy instance names kept for backward detection only; prior installs
-# used shorter / differently-worded names. Ordered newest-to-oldest.
-$script:PRISM_INSTANCE_LEGACY_NAMES = @(
-    'NVIDIA RTX Remix',
-    'RTX Remix 1.21.1 (Fabric)'
-)
-$script:PRISM_PORTABLE_DIR   = Join-Path $env:LOCALAPPDATA 'RtxRemixMinecraft\PrismLauncher'
-$script:MANAGED_JDK_DIR      = Join-Path $env:LOCALAPPDATA 'RtxRemixMinecraft\jdk-21'
+$script:APP_VERSION          = '0.1.0-trial.1.21.4-installer.1'
+$script:PRISM_INSTANCE_NAME  = 'RTX Remix 1.21.4 Trial'
+# Trial installs never discover or migrate upstream instances.
+$script:PRISM_INSTANCE_LEGACY_NAMES = @()
+$script:PRISM_PORTABLE_DIR   = Join-Path $env:LOCALAPPDATA 'RtxRemixMinecraftTrial1214\PrismLauncher'
+$script:MANAGED_JDK_DIR      = Join-Path $env:LOCALAPPDATA 'RtxRemixMinecraftTrial1214\jdk-21'
 $script:FABRIC_API_VERSION   = '0.119.4+1.21.4'
 $script:FABRIC_LOADER_VER    = '0.16.9'
 $script:MC_VERSION           = '1.21.4'
@@ -357,33 +352,107 @@ function Write-Banner {
     Write-Host ''
 }
 
+# --- Trial isolation boundary ---
+function Assert-TrialPath {
+    # Refuse redirects before writes or recursive deletes. A uniquely named
+    # instance is not isolated when a junction points into another game.
+    param([Parameter(Mandatory)] [string]$Path)
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $cursor = $full
+    while ($cursor) {
+        $item = $null
+        try { $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop }
+        catch {
+            if ($_.CategoryInfo.Category -ne [System.Management.Automation.ErrorCategory]::ObjectNotFound) { throw }
+        }
+        if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "Trial path contains a junction or symbolic link: $cursor"
+        }
+        $parent = Split-Path -Parent $cursor
+        if ($parent -eq $cursor) { break }
+        $cursor = $parent
+    }
+    if (Test-Path -LiteralPath $full -PathType Container) {
+        $pending = [System.Collections.Generic.Stack[string]]::new()
+        $pending.Push($full)
+        while ($pending.Count -gt 0) {
+            foreach ($item in @(Get-ChildItem -LiteralPath $pending.Pop() -Force -ErrorAction Stop)) {
+                if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    throw "Trial path contains a junction or symbolic link: $($item.FullName)"
+                }
+                if ($item.PSIsContainer) { $pending.Push($item.FullName) }
+            }
+        }
+    }
+}
+
+function Assert-TrialPrismInstance {
+    param([Parameter(Mandatory)] [string]$InstanceDir)
+    $full = [System.IO.Path]::GetFullPath($InstanceDir).TrimEnd('\', '/')
+    if ((Split-Path -Leaf $full) -ne $script:PRISM_INSTANCE_NAME) {
+        throw "Refusing to modify an instance other than '$($script:PRISM_INSTANCE_NAME)'."
+    }
+    Assert-TrialPath -Path $full
+    if (-not (Test-Path -LiteralPath $full)) { return }
+    $cfg = Join-Path $full 'instance.cfg'
+    $packPath = Join-Path $full 'mmc-pack.json'
+    if (-not (Test-Path -LiteralPath $cfg) -or -not (Test-Path -LiteralPath $packPath)) {
+        throw "Existing trial instance is incomplete. Back it up and move it aside before reinstalling: $full"
+    }
+    try { $pack = Get-Content -LiteralPath $packPath -Raw | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "Existing trial instance has invalid mmc-pack.json: $packPath" }
+    $mc = @($pack.components | Where-Object { $_.uid -eq 'net.minecraft' })
+    $fabric = @($pack.components | Where-Object { $_.uid -eq 'net.fabricmc.fabric-loader' })
+    if ($mc.Count -ne 1 -or $mc[0].version -ne $script:MC_VERSION -or
+        $fabric.Count -ne 1 -or $fabric[0].version -ne $script:FABRIC_LOADER_VER) {
+        throw "Existing trial instance does not target Minecraft $($script:MC_VERSION) / Fabric $($script:FABRIC_LOADER_VER). It was left unchanged."
+    }
+}
+
+function Assert-TrialMcDir {
+    param([Parameter(Mandatory)] [string]$McDir)
+    $full = [System.IO.Path]::GetFullPath($McDir).TrimEnd('\', '/')
+    if ((Split-Path -Leaf $full) -ne '.minecraft') { throw 'Expected the trial .minecraft directory.' }
+    $instanceDir = Split-Path -Parent $full
+    if (-not (Test-Path -LiteralPath $instanceDir -PathType Container)) { throw 'The trial instance must be initialized before modifying game files.' }
+    Assert-TrialPrismInstance -InstanceDir $instanceDir
+}
+
+function Assert-TrialPackage {
+    param([Parameter(Mandatory)] [string]$Jar)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Jar)
+    try {
+        $entry = $zip.GetEntry('fabric.mod.json')
+        if (-not $entry) { throw 'Package lacks fabric.mod.json.' }
+        $reader = [System.IO.StreamReader]::new($entry.Open())
+        try { $metadata = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop }
+        finally { $reader.Dispose() }
+        if ($metadata.id -ne 'rtx-remix-renderer' -or $metadata.depends.minecraft -ne $script:MC_VERSION -or
+            $metadata.version -notlike "$($script:APP_VERSION)-*") {
+            throw 'Package is not the matching unofficial Minecraft 1.21.4 trial build.'
+        }
+        $arch = if (Test-HostIsArm64) { 'arm64' } else { 'win64' }
+        foreach ($required in @("native/remix-sdk-$arch/d3d9.dll", "native/remix-sdk-$arch/remixbridge.dll")) {
+            if (-not $zip.GetEntry($required)) { throw "Package does not include $arch runtime: $required" }
+        }
+    } finally { $zip.Dispose() }
+}
+
 # --- Session / temp-dir lifecycle ---
 function Initialize-Session {
     # Per-run temp dir under %TEMP%. All downloads / staging live under here
     # so concurrent installers don't race on fixed paths. Torn down in the
     # entry-point's finally.
-    #
-    # Also sweep any rtx-remix-installer-* dirs older than a day from prior
-    # crashed runs: the entry-point finally doesn't fire on host crashes /
-    # OOM / forced restarts, so orphans accumulate over time (up to ~200 MB
-    # each if the crash happened mid-JDK-extract).
-    try {
-        Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter 'rtx-remix-installer-*' -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
-            ForEach-Object {
-                Write-Trace "Sweeping stale temp dir: $($_.FullName)"
-                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            }
-    } catch { Write-Trace "Stale-temp sweep failed (non-fatal): $($_.Exception.Message)" }
-
     $unique = [guid]::NewGuid().ToString('N').Substring(0, 8)
-    $script:SessionTempDir = Join-Path $env:TEMP "rtx-remix-installer-$unique"
+    $script:SessionTempDir = Join-Path $env:TEMP "rtx-remix-trial-1214-installer-$unique"
     New-Item -ItemType Directory -Path $script:SessionTempDir -Force | Out-Null
     Write-Trace "Session temp dir: $($script:SessionTempDir)"
 }
 
 function Remove-Session {
     if ($script:SessionTempDir -and (Test-Path -LiteralPath $script:SessionTempDir)) {
+        Assert-TrialPath -Path $script:SessionTempDir
         Remove-Item -LiteralPath $script:SessionTempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -420,7 +489,7 @@ function Test-PathLengthBudget {
       characters unless long-path-aware mode is opted into (manifest +
       registry), which we don't assume. The worst-case path we build is
       the instance mods jar:
-        $PrismDataDir\instances\RTX Remix 1.21.1 (Fabric)\.minecraft\mods\rtx-remix-renderer-0.1.0-{ts}-{hash}.jar
+        $PrismDataDir\instances\RTX Remix 1.21.4 Trial\.minecraft\mods\rtx-remix-renderer-{version}-{ts}-{hash}-win64.jar
       which adds ~122 fixed chars on top of $PrismDataDir. If the user's
       data dir starts out long (deep personal path, substituted drive
       letter, OneDrive redirect, etc.) we could bust 260 and see opaque
@@ -720,6 +789,7 @@ function Resolve-JavaForFabricInstaller {
 }
 
 function Install-ManagedJdk21 {
+    Assert-TrialPath -Path $script:MANAGED_JDK_DIR
     # Adoptium v3 binary endpoint redirects; we pre-fetch the assets list
     # to get the SHA-256 for supply-chain verification.
     $jdkArch   = if (Test-HostIsArm64) { 'aarch64' } else { 'x64' }
@@ -841,7 +911,7 @@ function Get-LauncherState {
         $hasPrism = $true
         $dataDir = Join-Path $env:APPDATA 'PrismLauncher'
     }
-    $hasMs = Test-Path -LiteralPath (Join-Path $env:APPDATA '.minecraft\launcher_profiles.json')
+    $hasMs = $false  # Microsoft shared game directories are unsupported by this trial.
     return [pscustomobject]@{
         HasPrism     = $hasPrism
         HasMs        = $hasMs
@@ -851,10 +921,8 @@ function Get-LauncherState {
 
 function Get-McDirForLauncher {
     param([string]$Launcher, [string]$PrismDataDir)
-    if ($Launcher -eq 'Prism') {
-        return Join-Path $PrismDataDir "instances\$($script:PRISM_INSTANCE_NAME)\.minecraft"
-    }
-    return Join-Path $env:APPDATA '.minecraft'
+    if ($Launcher -ne 'Prism') { throw 'This unofficial trial supports Prism only.' }
+    return Join-Path $PrismDataDir "instances\$($script:PRISM_INSTANCE_NAME)\.minecraft"
 }
 
 function Get-InstalledModVersion {
@@ -1317,13 +1385,7 @@ function Write-DetectedStateBlock {
 }
 
 # --- Install / Upgrade implementation ---
-# Launcher-selection policy:
-#   - Install / Upgrade / Repair: pick ONE launcher. Prism preferred when the
-#     user has a choice; always prompt in interactive mode if there's any
-#     ambiguity (both detected, or MS-only-detected which is arguably still
-#     ambiguous because the user might prefer us to install Prism portable).
-#   - Uninstall: Select-LauncherForUninstall allows 'Both' when both launchers
-#     have an installed mod, so the user can wipe both in one run.
+# Trial installation and removal are Prism-only.
 function Get-SoleInstalledLauncher {
     <#
       The launcher Upgrade and Repair keep without asking: 'Prism' or
@@ -1348,103 +1410,22 @@ function Select-Launcher {
         [pscustomobject]$State,
         [string]$Preferred,
         [switch]$Unattended,
-        # Biases the pick: when set (by Upgrade/Repair callers), if exactly
-        # one launcher has an existing install we pick THAT one without
-        # prompting even if both launchers are present. Install mode DOES
-        # NOT set this: a user who has an existing install in one launcher
-        # may legitimately want to install fresh into the other, and
-        # silently picking the first one would deny that option.
         [pscustomobject]$DetectedState,
         [switch]$BiasToInstalledLauncher
     )
-    if ($Preferred) {
-        $lname = $Preferred
-        if ($lname -eq 'Microsoft' -and -not $State.HasMs) {
-            throw 'Microsoft launcher not detected. Install it first from https://www.minecraft.net/en-us/download'
-        }
-        return $lname
-    }
-    if ($State.HasPrism -and -not $State.HasMs) { return 'Prism' }
-    # Bias (Upgrade/Repair only, gated by -BiasToInstalledLauncher):
-    # if exactly one launcher has an existing install, pick it without a
-    # prompt, and say how to reach the other one, since this run never
-    # offers it. Install mode never hits this branch; see param comment.
-    if ($BiasToInstalledLauncher -and $DetectedState -and $DetectedState.ModInstalled) {
-        $kept = Get-SoleInstalledLauncher -ModInstalled $DetectedState.ModInstalled
-        if ($kept) {
-            Write-Trace "Auto-selecting launcher '$kept': sole launcher with an existing install."
-            Write-Info "Keeping the launcher that already has the mod. To install into $(Get-OtherLauncherLabel -Launcher $kept) instead, run the installer again and choose Install."
-            return $kept
-        }
-    }
-    if ($State.HasMs    -and -not $State.HasPrism) {
-        # MS-only-detected in interactive mode: still prompt, because the
-        # user may prefer Prism even though only MS was found. A silent
-        # default here would lock them out of that choice.
-        if ($Unattended) { return 'Microsoft' }
-        $choice = Invoke-Menu -Title '  Microsoft launcher detected. Use it, or install Prism portable instead?' -Items @(
-            [pscustomobject]@{ Label = 'Use Microsoft launcher';  Hint = 'already installed';                          Value = 'Microsoft' }
-            [pscustomobject]@{ Label = 'Install Prism portable';  Hint = "recommended for modded setups (downloads $($script:MANAGED_JDK_DIR | Split-Path))"; Value = 'Prism' }
-        )
-        if (-not $choice) { throw 'Cancelled by user.' }
-        return $choice
-    }
-    if ($State.HasPrism -and $State.HasMs) {
-        if ($Unattended) {
-            # Contract: headless must not silently choose between launchers.
-            throw 'Both Prism and Microsoft launchers are present. -Launcher is required in -Unattended mode.'
-        }
-        $choice = Invoke-Menu -Title '  Both launchers detected. Which do you prefer?' -Items @(
-            [pscustomobject]@{ Label = 'Prism Launcher';     Hint = 'recommended for modded setups'; Value = 'Prism' }
-            [pscustomobject]@{ Label = 'Microsoft Launcher'; Hint = 'official Minecraft launcher';   Value = 'Microsoft' }
-        )
-        if (-not $choice) { throw 'Cancelled by user.' }
-        return $choice
-    }
-    if ($Unattended) { return 'Prism' }  # neither detected -> portable-install Prism
-    $choice = Invoke-Menu -Title '  No launcher detected. Install Prism or point at Microsoft?' -Items @(
-        [pscustomobject]@{ Label = 'Install Prism (portable)'; Hint = 'recommended'; Value = 'Prism' }
-        [pscustomobject]@{ Label = 'Use Microsoft Launcher';  Hint = 'must be installed manually first'; Value = 'Microsoft' }
-    )
-    if (-not $choice) { throw 'Cancelled by user.' }
-    if ($choice -eq 'Microsoft') {
-        throw 'Microsoft launcher not detected. Install from https://www.minecraft.net/en-us/download and re-run.'
+    if ($Preferred -and $Preferred -ne 'Prism') {
+        throw 'Microsoft Launcher is disabled in this trial. Use Prism to keep existing installations separate.'
     }
     return 'Prism'
 }
 
 function Select-LauncherForUninstall {
-    <#
-      Uninstall-specific variant: when both launchers have an installed mod,
-      also offer 'Both' so the user can wipe everywhere in one run.
-      Returns 'Prism' | 'Microsoft' | 'Both', or $null on cancel.
-    #>
     param([pscustomobject]$State, [string]$Preferred, [switch]$Unattended)
-    if ($Preferred) {
-        return $Preferred  # respect explicit -Launcher even if other side has mods
-    }
-    $prismHasMod = $State.ModInstalled.ContainsKey('Prism')
-    $msHasMod    = $State.ModInstalled.ContainsKey('Microsoft')
-    if ($prismHasMod -and -not $msHasMod) { return 'Prism' }
-    if ($msHasMod    -and -not $prismHasMod) { return 'Microsoft' }
-    if (-not $prismHasMod -and -not $msHasMod) {
-        # Fall back to the standard selector; lets Select-Launcher's
-        # error messaging kick in for "nothing detected".
-        return (Select-Launcher -State $State -Preferred $Preferred -Unattended:$Unattended)
-    }
-    if ($Unattended) {
-        throw 'Both Prism and Microsoft launchers have RTX Remix installed. -Launcher (or pass Both) is required in -Unattended mode.'
-    }
-    $choice = Invoke-Menu -Title '  RTX Remix is installed in both launchers. Which should I uninstall from?' -Items @(
-        [pscustomobject]@{ Label = 'Prism only';      Hint = "remove from Prism instance only";       Value = 'Prism' }
-        [pscustomobject]@{ Label = 'Microsoft only';  Hint = 'remove from the shared .minecraft/';    Value = 'Microsoft' }
-        [pscustomobject]@{ Label = 'Both launchers';  Hint = 'wipe RTX Remix from both in one pass';  Value = 'Both' }
-    )
-    if (-not $choice) { throw 'Cancelled by user.' }
-    return $choice
+    return Select-Launcher -State $State -Preferred $Preferred -Unattended:$Unattended
 }
 
 function Install-PrismPortable {
+    Assert-TrialPath -Path $script:PRISM_PORTABLE_DIR
     # Arch-matched, SHA-256 verified. Supports -PrismVersion for CI (pins
     # avoid GitHub's 60 req/hour rate limit).
     $pattern = if (Test-HostIsArm64) { 'MSVC-arm64-Portable' } else { 'MSVC-Portable' }
@@ -1634,6 +1615,7 @@ function Disable-PrismUpdateCheck {
 
 function Initialize-PrismInstance {
     param([string]$InstanceDir)
+    Assert-TrialPrismInstance -InstanceDir $InstanceDir
     $cfg = Join-Path $InstanceDir 'instance.cfg'
     if (Test-Path -LiteralPath $cfg) {
         Write-Info "Reusing existing Prism instance: $($script:PRISM_INSTANCE_NAME)"
@@ -1754,7 +1736,7 @@ function Sync-JvmArgs {
       this run either.
     #>
     param(
-        [ValidateSet('Prism','Microsoft')] [string]$For,
+        [ValidateSet('Prism')] [string]$For,
         [string]$PrismCfg,
         [switch]$Unattended
     )
@@ -1816,49 +1798,6 @@ function Sync-JvmArgs {
             Write-Info 'Keeping existing Prism JVM args.'
         }
         return
-    }
-
-    # Microsoft launcher: defensive JSON read.
-    $lp  = Join-Path $env:APPDATA '.minecraft\launcher_profiles.json'
-    $key = $script:FABRIC_PROFILE_KEY
-    if (-not (Test-Path -LiteralPath $lp)) { return }
-    $json = $null
-    try {
-        $raw = Get-Content -LiteralPath $lp -Raw
-        if (-not $raw) { return }
-        $json = $raw | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        Write-Warn "Could not parse launcher_profiles.json ($($_.Exception.Message)); skipping JVM args reconciliation."
-        return
-    }
-    if (-not $json -or -not $json.PSObject.Properties['profiles'] -or -not $json.profiles) {
-        Write-Trace 'launcher_profiles.json has no profiles section; Fabric installer will populate it.'
-        return
-    }
-    if (-not $json.profiles.PSObject.Properties[$key]) {
-        Write-Trace "MS launcher profile '$key' not present yet."
-        return
-    }
-    $profileObj = $json.profiles.$key
-    $current = if ($profileObj.PSObject.Properties['javaArgs']) { $profileObj.javaArgs } else { $null }
-    if ($current -eq $script:RECOMMENDED_JVM_ARGS) { Write-Info 'Microsoft launcher profile JVM args already match launcher defaults; no change.'; return }
-    if (-not $current) {
-        Write-Info 'Applying launcher default JVM args to Microsoft launcher profile.'
-        Write-MsLauncherJvmArgs
-        return
-    }
-    if (Test-InstallerJvmArgs -JvmArgs $current -For Microsoft) {
-        Write-Info 'Replacing the JVM args an earlier installer wrote to the Microsoft launcher profile with launcher defaults.'
-        Write-MsLauncherJvmArgs
-        Write-Info "Previous JVM args, kept in launcher_profiles.json.bak: $current"
-        return
-    }
-    if ($Unattended) { Write-Info 'Microsoft launcher JVM args differ; keeping existing (unattended).'; return }
-    if (Confirm-JvmArgsOverwrite -Label "Microsoft launcher profile '$key'" -Current $current -Recommended $script:RECOMMENDED_JVM_ARGS) {
-        Write-MsLauncherJvmArgs
-        Write-Info 'Microsoft launcher profile JVM args updated to launcher defaults.'
-    } else {
-        Write-Info 'Keeping existing Microsoft launcher JVM args.'
     }
 }
 
@@ -2190,38 +2129,19 @@ function Set-PrismCfgValues {
 }
 
 function Write-MsLauncherJvmArgs {
-    # Atomic, BOM-free rewrite of launcher_profiles.json. The launcher writes
-    # this file itself on shutdown, so an in-place write during launcher
-    # runtime can corrupt it.
-    $lp  = Join-Path $env:APPDATA '.minecraft\launcher_profiles.json'
-    $key = $script:FABRIC_PROFILE_KEY
-    try {
-        # The launcher writes BOM-less UTF-8. Windows PowerShell 5.1 would
-        # otherwise decode it through the active ANSI code page.
-        $raw  = [System.IO.File]::ReadAllText($lp, [System.Text.UTF8Encoding]::new($false))
-        $json = $raw | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        Write-Warn 'Could not parse launcher_profiles.json; JVM args update skipped.'
-        return
-    }
-    if (-not $json.PSObject.Properties['profiles'] -or -not $json.profiles -or -not $json.profiles.PSObject.Properties[$key]) {
-        Write-Trace "MS launcher profile '$key' not present; JVM args update skipped."
-        return
-    }
-    $json.profiles.$key | Add-Member -NotePropertyName javaArgs -NotePropertyValue $script:RECOMMENDED_JVM_ARGS -Force
-    $out = ($json | ConvertTo-Json -Depth 32)
-    Write-FileAtomic -Path $lp -Content $out -Backup
+    param([string]$JvmArgs)
+    throw 'Microsoft Launcher changes are disabled in this unofficial trial.'
 }
 
 function Confirm-JvmArgsOverwrite {
     param([string]$Label, [string]$Current, [string]$Recommended, [string[]]$Note)
     Write-Host ''
-    Write-Host "  $($script:ICON_WARN) $($script:C_YELLOW)$Label$($script:C_RESET) has custom JVM args that differ from the Minecraft 1.21.1 launcher defaults."
+    Write-Host "  $($script:ICON_WARN) $($script:C_YELLOW)$Label$($script:C_RESET) has custom JVM args that differ from the Minecraft 1.21.4 launcher defaults."
     Write-Host ''
     Write-Host "     $($script:C_BOLD)Current:$($script:C_RESET)     $($script:C_DIM)$Current$($script:C_RESET)"
     Write-Host "     $($script:C_BOLD)Recommended:$($script:C_RESET) $($script:C_DIM)$Recommended$($script:C_RESET)"
     Write-Host ''
-    Write-Host '  Minecraft 1.21.1 launcher defaults use G1GC and a 2 GB heap. Custom'
+    Write-Host '  Minecraft 1.21.4 launcher defaults use G1GC and a 2 GB heap. Custom'
     Write-Host '  args may include profiling flags, test toggles, or more memory.'
     foreach ($line in $Note) { if ($line) { Write-Host "  $line" } }
     return (Confirm-YesNo -Prompt 'Overwrite current JVM args with launcher defaults?' -DefaultNo)
@@ -2241,7 +2161,7 @@ function Initialize-Prism {
     if (-not $State.PrismDataDir) { $State.PrismDataDir = $script:PRISM_PORTABLE_DIR }
     $instanceDir = Join-Path $State.PrismDataDir "instances\$($script:PRISM_INSTANCE_NAME)"
     Initialize-PrismInstance -InstanceDir $instanceDir
-    Write-Info 'Configuring Minecraft 1.21.1 launcher JVM defaults...'
+    Write-Info 'Configuring Minecraft 1.21.4 launcher JVM defaults...'
     Sync-JvmArgs -For Prism -PrismCfg (Join-Path $instanceDir 'instance.cfg') -Unattended:$Unattended
     Set-PrismJavaPin -InstanceCfg (Join-Path $instanceDir 'instance.cfg')
     return $instanceDir
@@ -2265,101 +2185,27 @@ function Test-MsFabricProfileRegistered {
 
 function Initialize-MicrosoftLauncher {
     param([string]$JavaExe, [switch]$Unattended)
-    if (-not (Test-Path -LiteralPath (Join-Path $env:APPDATA '.minecraft\launcher_profiles.json'))) {
-        throw 'Microsoft Minecraft launcher not detected. Install it first from https://www.minecraft.net/en-us/download'
-    }
-    # Both conditions are required. Users who delete a Fabric profile entry in
-    # the launcher UI leave the versions/ dir behind; if we only checked that,
-    # we'd short-circuit and the launcher UI would have no entry to select.
-    $versionDir   = Join-Path $env:APPDATA ".minecraft\versions\$($script:FABRIC_VERSION_ID)"
-    $hasVersion   = Test-Path -LiteralPath $versionDir
-    $hasProfile   = Test-MsFabricProfileRegistered
-    if ($hasVersion -and $hasProfile) {
-        Write-Info "Reusing existing Fabric $($script:FABRIC_LOADER_VER) for MC $($script:MC_VERSION)"
-    } else {
-        if ($hasVersion -and -not $hasProfile) {
-            Write-Info "Fabric $($script:FABRIC_LOADER_VER) version dir exists but no launcher profile entry; re-running installer to re-register it."
-        } else {
-            Write-Info 'Downloading Fabric installer...'
-        }
-        $url = "https://maven.fabricmc.net/net/fabricmc/fabric-installer/$($script:FABRIC_INSTALLER_VER)/fabric-installer-$($script:FABRIC_INSTALLER_VER).jar"
-        $jar = New-SessionTempPath 'fabric-installer.jar'
-        $pinned = if ($script:FABRIC_INSTALLER_SHA256) { $script:FABRIC_INSTALLER_SHA256 } else { $null }
-        Invoke-VerifiedDownload -Url $url -Destination $jar -ExpectedSha256 $pinned -ChecksumUrl "$url.sha256"
-        # NOT -noprofile: we want the fabric-loader profile registered in
-        # launcher_profiles.json so it appears in the launcher UI. The
-        # installer is idempotent, safe to re-run when the version dir
-        # already exists; it just updates/re-registers the profile entry.
-        # Captured, not left in the output stream: its lines would otherwise be
-        # returned by Invoke-InstallOrUpgrade along with the exit code.
-        $fabricOut = & $JavaExe -jar $jar client -mcversion $script:MC_VERSION -loader $script:FABRIC_LOADER_VER 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            $fabricOut | ForEach-Object { Write-Warn "$_" }
-            throw 'Fabric installer execution failed (non-zero exit).'
-        }
-    }
-    Set-MsLauncherProfileName
-    Write-Info 'Configuring Minecraft 1.21.1 launcher JVM defaults on the Fabric profile...'
-    Sync-JvmArgs -For Microsoft -Unattended:$Unattended
+    throw 'Microsoft Launcher changes are disabled in this unofficial trial.'
 }
 
 function Set-MsLauncherProfileName {
-    <#
-      Rename the Fabric profile in launcher_profiles.json from the Fabric
-      installer's default (typically 'fabric-loader-<mc>', same as the
-      profile key) to our user-facing label. Also treats prior names we've
-      shipped as "default" so re-running the installer after we rename
-      updates cleanly. Any other name is treated as a user customization
-      and left alone.
-    #>
-    $lp = Join-Path $env:APPDATA '.minecraft\launcher_profiles.json'
-    if (-not (Test-Path -LiteralPath $lp)) { return }
-    try {
-        $raw = Get-Content -LiteralPath $lp -Raw
-        $json = $raw | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        Write-Warn "Could not parse launcher_profiles.json; profile rename skipped."
-        return
-    }
-    $key = $script:FABRIC_PROFILE_KEY
-    if (-not $json.PSObject.Properties['profiles'] -or -not $json.profiles -or -not $json.profiles.PSObject.Properties[$key]) {
-        Write-Trace "MS launcher profile '$key' not present; profile rename skipped."
-        return
-    }
-    $profileObj = $json.profiles.$key
-    $currentName = if ($profileObj.PSObject.Properties['name']) { $profileObj.name } else { '' }
-    $defaults = @(
-        $key                                              # Fabric installer default (e.g. 'fabric-loader-1.21.1')
-        ''                                                # empty name
-        'fabric-loader'                                   # legacy Fabric installer default
-        "fabric-loader-$($script:FABRIC_LOADER_VER)-$($script:MC_VERSION)"  # older loader-included key
-        'NVIDIA RTX Remix'                                # our prior label
-        'RTX Remix'                                       # any earlier labels we might have used
-    )
-    if ($currentName -eq $script:FABRIC_PROFILE_NAME) {
-        Write-Trace "MS launcher profile already named '$($script:FABRIC_PROFILE_NAME)'; no change."
-        return
-    }
-    if ($defaults -notcontains $currentName) {
-        Write-Info "MS launcher profile has a custom name ('$currentName'); leaving untouched. Rename manually in the launcher UI if you'd prefer '$($script:FABRIC_PROFILE_NAME)'."
-        return
-    }
-    $profileObj | Add-Member -NotePropertyName name -NotePropertyValue $script:FABRIC_PROFILE_NAME -Force
-    $out = ($json | ConvertTo-Json -Depth 32)
-    Write-FileAtomic -Path $lp -Content $out -Backup
-    Write-Info "Renamed Microsoft launcher profile to '$($script:FABRIC_PROFILE_NAME)'."
+    param()
+    throw 'Microsoft Launcher changes are disabled in this unofficial trial.'
 }
 
 function Install-ModFiles {
     param([string]$McDir)
+    Assert-TrialMcDir -McDir $McDir
     Write-Info "Installing mod files to $McDir"
-    if (-not (Test-Path -LiteralPath $McDir))                    { New-Item -ItemType Directory -Path $McDir -Force | Out-Null }
-    if (-not (Test-Path -LiteralPath (Join-Path $McDir 'mods'))) { New-Item -ItemType Directory -Path (Join-Path $McDir 'mods') -Force | Out-Null }
-
     # Resolve + validate the new JAR BEFORE touching anything. A broken dist
     # must not turn an upgrade into a destructive failure.
     $newJar = Get-DistModJar
     if (-not $newJar) { throw "No rtx-remix-renderer JAR found in $(Join-Path $script:SCRIPT_DIR 'mods')" }
+
+    Assert-TrialPackage -Jar $newJar
+    if (-not (Test-Path -LiteralPath (Join-Path $McDir 'mods'))) {
+        New-Item -ItemType Directory -Path (Join-Path $McDir 'mods') -Force -ErrorAction Stop | Out-Null
+    }
 
     # Stage-in via temp name next to target, then prune old, then rename.
     $finalPath  = Join-Path $McDir "mods\$(Split-Path $newJar -Leaf)"
@@ -2406,7 +2252,8 @@ function Install-FabricApi {
       .minecraft/mods): install ours alongside; DO NOT prune others, since
       other Fabric profiles on the same shared dir would break.
     #>
-    param([string]$McDir, [ValidateSet('Prism','Microsoft')] [string]$Launcher)
+    param([string]$McDir, [ValidateSet('Prism')] [string]$Launcher)
+    Assert-TrialMcDir -McDir $McDir
     $desired = "fabric-api-$($script:FABRIC_API_VERSION).jar"
     $target  = Join-Path $McDir "mods\$desired"
 
@@ -2694,6 +2541,10 @@ function Install-DevServer {
 
 function Invoke-InstallOrUpgrade {
     param([string]$PreferredLauncher, [switch]$Unattended, [string]$Mode)
+    # Validate the artifact and target before downloads or launcher changes.
+    $newJar = Get-DistModJar
+    if (-not $newJar) { throw 'No packaged trial JAR found in mods/.' }
+    Assert-TrialPackage -Jar $newJar
     # An interactive run starts at the first step; the banner heads headless logs.
     if ($Unattended) { Write-Banner -Title "RTX Remix for Minecraft - $Mode" -Subtitle "v$($script:APP_VERSION)" }
     # Repair / Upgrade / Install all share this code path; differ only in
@@ -2707,6 +2558,8 @@ function Invoke-InstallOrUpgrade {
     # Fetch the richer state too; lets Select-Launcher do the "auto-pick
     # the launcher with an existing install" bias on Upgrade/Repair.
     $detected = Get-DetectedState
+    $trialDataDir = if ($state.PrismDataDir) { $state.PrismDataDir } else { $script:PRISM_PORTABLE_DIR }
+    Assert-TrialPrismInstance -InstanceDir (Join-Path $trialDataDir "instances\$($script:PRISM_INSTANCE_NAME)")
 
     Write-Step 'Selecting launcher'
     # Only Upgrade/Repair bias toward the installed launcher. Install (and
@@ -2735,8 +2588,7 @@ function Invoke-InstallOrUpgrade {
         $instanceDir = Initialize-Prism -State $state -Unattended:$Unattended
         $mcDir = Join-Path $instanceDir '.minecraft'
     } else {
-        Initialize-MicrosoftLauncher -JavaExe $installerJava -Unattended:$Unattended
-        $mcDir = Join-Path $env:APPDATA '.minecraft'
+        throw 'This trial supports Prism only.'
     }
 
     Write-Step 'Installing mod files'
@@ -2833,8 +2685,7 @@ function Start-InstalledLauncher {
                 # Explorer cannot pass --dir, so redirect its output instead:
                 # Start-Process needs two different files, and a fresh name per
                 # launch because a running Prism still holds the last pair.
-                Get-ChildItem $env:TEMP -Filter 'rtx-remix-prism-*.log' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                $logBase = Join-Path $env:TEMP "rtx-remix-prism-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+                $logBase = Join-Path $env:TEMP "rtx-remix-trial-1214-prism-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
                 $startArgs.RedirectStandardOutput = "$logBase-out.log"
                 $startArgs.RedirectStandardError = "$logBase-err.log"
                 Start-Process @startArgs
@@ -2923,18 +2774,12 @@ function Invoke-Uninstall {
 
     # Resolve the list of (launcher, mcDir) pairs we'll act on.
     $targets = @()
-    if ($launcherChoice -in @('Prism', 'Both')) {
+    if ($launcherChoice -eq 'Prism') {
         if ($detected.PrismDataDir) {
             $targets += [pscustomobject]@{
                 Launcher = 'Prism'
                 McDir    = Join-Path $detected.PrismDataDir "instances\$($script:PRISM_INSTANCE_NAME)\.minecraft"
             }
-        }
-    }
-    if ($launcherChoice -in @('Microsoft', 'Both')) {
-        $targets += [pscustomobject]@{
-            Launcher = 'Microsoft'
-            McDir    = Join-Path $env:APPDATA '.minecraft'
         }
     }
 
@@ -2960,7 +2805,7 @@ function Invoke-Uninstall {
         Write-Host ''
         Write-Host '  The following will be removed from each target:'
         Write-Host "    - $($script:C_DIM)<mc>/mods/rtx-remix-renderer-*.jar$($script:C_RESET)"
-        Write-Host "    - $($script:C_DIM)<mc>/mods/fabric-api-$($script:FABRIC_API_VERSION).jar$($script:C_RESET) (Microsoft: only our exact version; Prism: all fabric-api-*)"
+        Write-Host "    - $($script:C_DIM)<mc>/mods/fabric-api-$($script:FABRIC_API_VERSION).jar$($script:C_RESET) (trial instance only)"
         Write-Host "    - $($script:C_DIM)<mc>/remix-sdk/, <mc>/rtx.conf, <mc>/.rtx-remix-version$($script:C_RESET)"
         Write-Host "    - $($script:C_DIM)<mc>/textures/water_normals_flipbook.dds, <mc>/textures/overcast_thunderstorm_bc6u.dds$($script:C_RESET)"
         Write-Host "    - $($script:C_DIM)<mc>/resourcepacks/RtxRemix-LabPBR/$($script:C_RESET) (if left by an earlier version)"
@@ -3002,16 +2847,16 @@ function Invoke-Uninstall {
             $menuItems += [pscustomobject]@{ Label = 'Also remove installer-managed Java'; Hint = $jdkHint; Value = 'jdk' }
         }
         if ($touchedPrism -and $hasPortable) {
-            $menuItems += [pscustomobject]@{ Label = 'Also remove our Prism portable'; Hint = "$($script:PRISM_PORTABLE_DIR)"; Value = 'prism' }
+            $menuItems += [pscustomobject]@{ Label = 'Also remove our Prism portable'; Hint = 'deletes ALL instances and worlds inside the trial portable root'; Value = 'prism' }
         }
         if ($touchedPrism -and $detected.PrismDataDir) {
             $instancePath = Join-Path $detected.PrismDataDir "instances\$($script:PRISM_INSTANCE_NAME)"
             if (Test-Path -LiteralPath $instancePath) {
-                $menuItems += [pscustomobject]@{ Label = 'Remove the RTX Remix Prism instance only'; Hint = 'keeps Prism and your other instances'; Value = 'instance' }
+                $menuItems += [pscustomobject]@{ Label = 'Remove the RTX Remix Prism instance only'; Hint = 'deletes this trial instance and its worlds; keeps other instances'; Value = 'instance' }
             }
         }
         if ($touchedPrism -and ($hasManagedJdk -or $hasPortable -or ($detected.PrismDataDir -and (Test-Path -LiteralPath (Join-Path $detected.PrismDataDir "instances\$($script:PRISM_INSTANCE_NAME)"))))) {
-            $menuItems += [pscustomobject]@{ Label = 'Scorched earth'; Hint = 'instance + managed Java + our Prism portable'; Value = 'all' }
+            $menuItems += [pscustomobject]@{ Label = 'Scorched earth'; Hint = 'deletes ALL trial-portable instances, worlds, managed Java and Prism'; Value = 'all' }
         }
 
         if ($menuItems.Count -gt 1) {
@@ -3035,7 +2880,8 @@ function Invoke-Uninstall {
 }
 
 function Remove-ModArtifacts {
-    param([string]$McDir, [ValidateSet('Prism','Microsoft')] [string]$Launcher)
+    param([string]$McDir, [ValidateSet('Prism')] [string]$Launcher)
+    Assert-TrialMcDir -McDir $McDir
     if (-not (Test-Path -LiteralPath $McDir)) { return }
 
     Get-ChildItem -LiteralPath (Join-Path $McDir 'mods') -Filter 'rtx-remix-renderer-*.jar' -ErrorAction SilentlyContinue |
@@ -3067,6 +2913,7 @@ function Remove-ModArtifacts {
 }
 
 function Remove-ManagedJdk {
+    Assert-TrialPath -Path $script:MANAGED_JDK_DIR
     if (Test-Path -LiteralPath $script:MANAGED_JDK_DIR) {
         Remove-Item -LiteralPath $script:MANAGED_JDK_DIR -Recurse -Force
         Write-Info "Removed managed JDK at $($script:MANAGED_JDK_DIR)"
@@ -3074,6 +2921,7 @@ function Remove-ManagedJdk {
 }
 
 function Remove-PrismPortable {
+    Assert-TrialPath -Path $script:PRISM_PORTABLE_DIR
     if (Test-Path -LiteralPath $script:PRISM_PORTABLE_DIR) {
         Remove-Item -LiteralPath $script:PRISM_PORTABLE_DIR -Recurse -Force
         Write-Info "Removed Prism portable at $($script:PRISM_PORTABLE_DIR)"
@@ -3083,7 +2931,9 @@ function Remove-PrismPortable {
 function Remove-PrismInstance {
     param([string]$DataDir, [string]$InstanceName = $script:PRISM_INSTANCE_NAME)
     if (-not $DataDir) { return }
+    if ($InstanceName -ne $script:PRISM_INSTANCE_NAME) { throw 'Only the trial instance may be removed.' }
     $path = Join-Path $DataDir "instances\$InstanceName"
+    Assert-TrialPrismInstance -InstanceDir $path
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Recurse -Force
         Write-Info "Removed Prism instance at $path"
@@ -3160,6 +3010,7 @@ function Invoke-Export {
         Write-Err "No Prism instance found at $instanceDir; nothing to export."
         return 1
     }
+    Assert-TrialPrismInstance -InstanceDir $instanceDir
     $mcDir = Join-Path $instanceDir '.minecraft'
     $modVer = Get-InstalledModVersion -McDir $mcDir
     if (-not $modVer) { Write-Warn 'No RTX Remix mod JAR in the instance; exporting anyway.' }
@@ -3169,13 +3020,14 @@ function Invoke-Export {
             Write-Err '-OutputPath is required in unattended export mode.'
             return 2
         }
-        $default = Join-Path $HOME "Downloads\rtx-remix-portable-$($script:APP_VERSION).zip"
+        $default = Join-Path $HOME "Downloads\rtx-remix-trial-1214-portable-$($script:APP_VERSION).zip"
         Write-Host ''
         Write-Host -NoNewline "  Output path [$($script:C_DIM)$default$($script:C_RESET)]: "
         $entered = Read-Host
         $OutputPath = if ([string]::IsNullOrWhiteSpace($entered)) { $default } else { $entered }
     }
     $OutputPath = Test-PathOutputValid -Path $OutputPath
+    Assert-TrialPath -Path $OutputPath
     $parent = Split-Path -Parent $OutputPath
     if ($parent -and -not (Test-Path -LiteralPath $parent)) {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
@@ -3198,7 +3050,7 @@ function Invoke-Export {
     Copy-InstanceForExport -Source $instanceDir -Dest $dest
 
     $readme = @"
-RTX Remix for Minecraft: portable export
+Unofficial RTX Remix for Minecraft 1.21.4 trial: portable export
 Generated (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))
 Source instance: $modVer
 
@@ -3206,7 +3058,6 @@ To install on another machine:
 1. Install Prism Launcher: https://prismlauncher.org
 2. Extract this zip into Prism's instances/ folder, e.g.:
      Windows: %APPDATA%\PrismLauncher\instances\
-     Linux  : ~/.local/share/PrismLauncher/instances/
 3. Open Prism -> select '$($script:PRISM_INSTANCE_NAME)' -> Launch.
 
 Not included (intentionally):
@@ -3341,7 +3192,7 @@ function Show-MainMenu {
         default      { '' }
     }
     $header = {
-        Write-Banner -Title 'RTX Remix for Minecraft - Installer' -Subtitle "v$($script:APP_VERSION)"
+        Write-Banner -Title 'Unofficial RTX Remix 1.21.4 Trial' -Subtitle "v$($script:APP_VERSION)"
         Write-DetectedStateBlock -State $state
         Write-Host ''
         if ($headline) {
@@ -3373,22 +3224,9 @@ function Show-MainMenu {
     $items = @(
         [pscustomobject]@{ Label = $installLabel; Hint = $installHint; Value = $installValue; Disabled = ($status -eq 'no-package') }
     )
-    # If the primary action is Upgrade or Repair, also offer Install
-    # (forces fresh-install UX even when we detected an existing one) and
-    # the other of Upgrade/Repair as a secondary option. Upgrade and Repair
-    # keep the launcher that already has the mod, so Install, which asks,
-    # is the way into the other launcher; its hint names it. With Prism and
-    # no Microsoft launcher, Select-Launcher takes Prism without asking, so
-    # the hint says what the Microsoft launcher needs first instead.
+    # Explicit Install also targets only the isolated trial instance.
     if ($installValue -ne 'Install') {
-        $kept = Get-SoleInstalledLauncher -ModInstalled $state.ModInstalled
-        $switchHint = if ($state.HasPrism -and -not $state.HasMs) {
-            'reinstall into Prism; for the Microsoft launcher, install and start it first'
-        } elseif ($kept) {
-            "choose the launcher, e.g. to use $(Get-OtherLauncherLabel -Launcher $kept) instead"
-        } else {
-            'choose the launcher'
-        }
+        $switchHint = 'reinstall into the isolated 1.21.4 trial instance'
         $items += [pscustomobject]@{ Label = 'Install'; Hint = $switchHint; Value = 'Install'; Disabled = ($status -eq 'no-package') }
     }
     if ($installValue -eq 'Upgrade') {
